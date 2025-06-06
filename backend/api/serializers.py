@@ -1,33 +1,26 @@
-# backend/serializers.py
+# backend/serializers.py (oder backend/serializers/tasks_serializers.py, je nach deiner Struktur)
+
 from rest_framework import serializers
 from backend.models import Contacts, Subtask, Task
-from django.contrib.auth.models import User 
-from django.contrib.auth import authenticate # Wird für den LoginSerializer benötigt
-from backend.models import Contacts # Das Contacts-Modell hier importieren
-from django.db.models import Q # Für komplexe Lookups im create/validate 
+from django.contrib.auth.models import User
+from django.contrib.auth import authenticate
 
-#Contacts
+# Contacts Serializer
 class ContactsSerializer(serializers.ModelSerializer):
-    # has_password_set kann optional hinzugefügt werden, wenn du es im Frontend brauchst,
-    # um den Status eines Kontakts (registriert/unregistriert) anzuzeigen.
-    # Hier ist es nur für die Lesbarkeit (read_only).
     has_password_set = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Contacts
-        fields = '__all__' # Oder eine explizite Liste von Feldern, die du zurückgeben möchtest
+        fields = '__all__'
 
     def get_has_password_set(self, obj):
-        # Diese Methode wird nur aufgerufen, wenn 'has_password_set' in den fields ist.
-        # Prüft, ob der verknüpfte User existiert und ein nutzbares Passwort hat.
         return obj.user is not None and obj.user.has_usable_password()
-    
 
-# Tasks
+# SubTask Serializer
 class SubTaskSerializer(serializers.ModelSerializer):
     class Meta:
         model = Subtask
-        fields = ['subtasktext', 'done']
+        fields = ['id', 'subtasktext', 'done', 'task_id']
 
 
 class TaskSerializer(serializers.ModelSerializer):
@@ -48,14 +41,57 @@ class TaskSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         subtasks_data = validated_data.pop('subtasks', [])
+        assignee_ids = validated_data.pop('assignee_infos', [])
+
         task = super().create(validated_data)
 
         for subtask_data in subtasks_data:
             Subtask.objects.create(task=task, **subtask_data)
 
+        task.assignee_infos.set(assignee_ids)
+
         return task
 
+    def update(self, instance, validated_data):
+        
+        subtasks_data = validated_data.pop('subtasks', None)
+        assignee_ids = validated_data.pop('assignee_infos', None)
+
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+
+        if subtasks_data is not None:
+            existing_subtasks = {subtask.id: subtask for subtask in instance.subtasks.all()}
+            subtasks_to_keep_ids = []
+
+            for subtask_data in subtasks_data:
+                subtask_id = subtask_data.get('id')
+
+                if subtask_id:
+                    subtask = existing_subtasks.get(subtask_id)
+                    if subtask:
+
+                        for attr, value in subtask_data.items():
+                            setattr(subtask, attr, value)
+                        subtask.save()
+                        subtasks_to_keep_ids.append(subtask_id)
+                    else:
+                        Subtask.objects.create(task=instance, **subtask_data)
+                else:
+                    Subtask.objects.create(task=instance, **subtask_data)
+
+            for subtask_id, subtask_instance in existing_subtasks.items():
+                if subtask_id not in subtasks_to_keep_ids:
+                    subtask_instance.delete()
+
+        if assignee_ids is not None: 
+            instance.assignee_infos.set(assignee_ids)
+
+        return instance
+
     def to_representation(self, instance):
+
         ret = super().to_representation(instance)
 
         if 'task_id' in ret:
@@ -73,23 +109,13 @@ class TaskSerializer(serializers.ModelSerializer):
                 'name': contact.name,
                 'color': contact.color
             })
-
         ret['assignee-infos'] = detailed_assignees
 
         return ret
 
-    def get_assignee_infos(self, obj):
 
-        return [
-            {'id': contact.id, 'name': contact.name, 'color': contact.color}
-            for contact in obj.assignee_infos.all()
-        ]
-
-
+# Login Serializer
 class LoginSerializer(serializers.Serializer):
-    """
-    Serializer für den Login-Vorgang.
-    """
     email = serializers.EmailField(required=True)
     password = serializers.CharField(write_only=True, required=True)
 
@@ -109,9 +135,9 @@ class LoginSerializer(serializers.Serializer):
 
         data['user'] = user
         return data
+    
 
-
-
+# Register Serializer
 class RegisterSerializer(serializers.Serializer):
     email = serializers.EmailField(required=True)
     password = serializers.CharField(write_only=True, required=True, min_length=8)
@@ -119,8 +145,6 @@ class RegisterSerializer(serializers.Serializer):
 
     def validate_email(self, value):
         email_lower = value.lower()
-        # Diese Prüfung bleibt bestehen, da User.objects.filter direkt auf das Passwortfeld zugreifen kann.
-        # Es prüft, ob ein User mit dieser E-Mail existiert UND ein Passwort gesetzt hat.
         if User.objects.filter(email=email_lower, password__isnull=False).exists():
              raise serializers.ValidationError("Ein Benutzer mit dieser E-Mail-Adresse ist bereits registriert.")
         return email_lower
@@ -133,51 +157,33 @@ class RegisterSerializer(serializers.Serializer):
         user_instance = None
         contact_instance = None
 
-        # --- NEUE LOGIK FÜR DIE SUCHE NACH BESTEHENDEM KONTAKT ---
-        # 1. Versuche, einen Kontakt mit der E-Mail zu finden.
-        #    Wir können hier nur auf 'user__isnull' prüfen, nicht auf 'has_usable_password'.
         potential_contacts = Contacts.objects.filter(email__iexact=email).first()
 
-        # Jetzt prüfen wir die Bedingung in Python
         if potential_contacts:
-            # Ein Kontakt mit dieser E-Mail existiert. Jetzt prüfen wir den User-Status.
-            # Ein Contact ist "unregistriert", wenn:
-            # a) Er keinen verknüpften User hat (contact_instance.user is None) ODER
-            # b) Er einen verknüpften User hat, ABER DIESER USER KEIN nutzbares Passwort hat.
             if potential_contacts.user is None or not potential_contacts.user.has_usable_password():
                 contact_instance = potential_contacts
                 print(f"DEBUG: Bestehender UNREGISTRIERTER Kontakt mit E-Mail '{email}' gefunden.")
             else:
-                # Dieser Kontakt ist bereits mit einem registrierten Benutzer verknüpft.
-                # Das sollte durch validate_email() bereits abgefangen worden sein,
-                # aber zur Sicherheit könnte man hier auch einen Fehler werfen.
-                # In diesem Fall gehen wir davon aus, dass validate_email() seinen Job gemacht hat.
-                # Wenn wir hier ankommen, dann bedeutet es, dass der Benutzer bereits registriert ist.
                 raise serializers.ValidationError("Ein Benutzer mit dieser E-Mail-Adresse ist bereits registriert.")
         
-        # --- ENDE NEUE LOGIK ---
-
-
-        if contact_instance: # Wenn ein passender unregistrierter Kontakt gefunden wurde
+        if contact_instance:
             if not contact_instance.user:
-                # Fall a): Kontakt hat keinen User, erstelle einen neuen User und verknüpfe ihn.
                 user_instance = User.objects.create_user(username=email, email=email, password=password)
-                contact_instance.user = user_instance  # <-- HIER WIRD VERKNÜPFT!
+                contact_instance.user = user_instance
                 contact_instance.save()
                 print(f"DEBUG: Neuer Benutzer für bestehenden Kontakt '{email}' erstellt und verknüpft.")
             else:
-                # Fall b): Kontakt hat einen User ohne Passwort, setze das Passwort.
                 user_instance = contact_instance.user
                 user_instance.set_password(password)
                 user_instance.save()
                 print(f"DEBUG: Passwort für bestehenden Benutzer '{email}' gesetzt.")
-        else: # Wenn kein passender unregistrierter Kontakt gefunden wurde
+        else:
             print(f"DEBUG: Kein unregistrierter Kontakt mit E-Mail '{email}' gefunden. Erstelle neuen Benutzer und Kontakt.")
             user_instance = User.objects.create_user(username=email, email=email, password=password)
             contact_instance = Contacts.objects.create(
                 name=name,
                 email=email,
-                user=user_instance # <-- HIER WIRD VERKNÜPFT!
+                user=user_instance
             )
             print(f"DEBUG: Neuer Benutzer und Kontakt für '{email}' erstellt und verknüpft.")
 

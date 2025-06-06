@@ -20,12 +20,11 @@ class Contacts(models.Model):
     class Meta:
         verbose_name_plural = "Contacts"
     
-    # NEU: Eine Property, um im Code leicht zu prüfen, ob es ein registrierter Benutzer ist
     @property
     def is_registered_user(self):
         return self.user is not None and self.user.has_usable_password()
 
-# tasks (bleiben unverändert in models.py)
+# Subtasks
 class Subtask(models.Model):
     subtasktext = models.CharField(max_length=255)
     done = models.BooleanField(default=False)
@@ -41,7 +40,7 @@ class Subtask(models.Model):
     class Meta:
         verbose_name_plural = "Subtasks"
 
-
+# Tasks
 class Task(models.Model):
     task_id = models.IntegerField(unique=True, null=True, blank=True)
     category = models.CharField(max_length=100)
@@ -78,7 +77,7 @@ class Task(models.Model):
         verbose_name_plural = "Tasks"
 
 @receiver(post_save, sender=Task)
-def set_task_id(sender, instance, created, **kwargs):
+def set_task_id(instance, created):
     if created and instance.task_id is None:
         instance.task_id = instance.id
         instance.save(update_fields=['task_id'])
